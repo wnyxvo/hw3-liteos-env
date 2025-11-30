@@ -1,0 +1,189 @@
+# Copyright (c) 2022 Huawei Device Co., Ltd.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+declare_args() {
+  app_ui_test = false
+  app_ability_test = false
+  app_hello_test = false
+  app_math_test = false
+  app_file_test = false
+  app_tpm_test = true
+  app_malloc_test = false
+  app_openhitls_sm2_test = false
+}
+
+static_library("hello_demo") {
+  sources = [ "hello/hello_test.c" ]
+  
+  include_dirs = [
+      "hello",
+      "//base/hiviewdfx/hilog_lite/interfaces/native/kits/hilog_lite",
+  ]
+
+  deps = [
+    "//base/hiviewdfx/hilog_lite/frameworks/mini:hilog_lite",
+  ]
+}
+
+static_library("math_demo") {
+  sources = [ "math_test/math_test.c" ]
+
+  include_dirs = [
+      "math_test",
+      "//sample/math_lib/include",
+      "//kernel/liteos_m/kal/cmsis",
+      "//commonlibrary/utils_lite/include",
+    ]
+
+  deps = [
+    "//sample/math_lib:math_lib",
+  ]
+}
+
+static_library("file_demo") {
+  sources = [ "file_test/file_test.c" ]
+
+  include_dirs = [
+      "file_test",
+      "//kernel/liteos_m/kal/cmsis",
+      "//commonlibrary/utils_lite/include",
+    ]
+}
+
+static_library("tpm_demo") {
+  sources = [ "tpm_test/tpm_test.c" ]
+
+  include_dirs = [
+    "tpm_test",
+    "//base/security/tpm/Platform/include",
+    "//base/security/tpm/tpm/include/public",
+    "//base/security/tpm/tpm/include/platform_interface",
+    "//base/security/tpm/TpmConfiguration",
+    "//base/security/tpm/tpm/include/platform_interface/prototypes",
+  ]
+
+  deps = [
+    "//base/security/tpm:libtpm"
+  ]
+}
+
+static_library("malloc_demo") {
+  sources = [ "malloc_test/malloc_test.c" ]
+
+  include_dirs = [
+    "malloc_test",
+    "//commonlibrary/utils_lite/include",
+    "//kernel/liteos_m/kal/cmsis",
+  ]
+}
+
+static_library("openhitls_demo") {
+  sources = [ "openhitls_test/openhitls_sm2_test.c" ]
+
+  include_dirs = [
+        "openhitls_test",
+        "//kernel/liteos_m/kal/cmsis",
+        "//third_party/openhitls/include/crypto",
+        "//third_party/openhitls/include/bsl",
+        "//third_party/openhitls/crypto/include",
+        "//third_party/openhitls/crypto/sm2/include",
+        "//third_party/openhitls/crypto/sm3/include",
+        "//third_party/openhitls/crypto/sm4/include",
+        "//third_party/openhitls/crypto/ecc/include",
+        "//third_party/openhitls/config/macro_config"
+    ]
+  deps = [
+      "//third_party/openhitls:libhitls_bsl",
+      "//third_party/openhitls:libhitls_crypto",
+  ]
+}
+
+static_library("example") {
+  sources = [ "app.cpp" ]
+  defines = []
+  deps = []
+  include_dirs = []
+
+  if (app_ui_test) {
+    deps += [ "ui:ui_demo" ]
+    defines += [ "UI_TEST" ]
+    include_dirs += [ "ui" ]
+  } else if (app_ability_test) {
+    deps += [ "ability:ability_demo" ]
+    defines += [ "ABILITY_TEST" ]
+    include_dirs += [ "ability" ]
+  }
+
+  if (app_hello_test) {
+    # Link the hello test implementation directly into the example so symbols
+    # such as HelloTaskInit are available at final link time.
+    sources += [ "hello/hello_test.c" ]
+    deps += [ ":hello_demo" ]
+    defines += [ "HELLO_TEST" ]
+    include_dirs += [ "hello" ]
+  } 
+  
+  if (app_math_test) {
+    sources += [ "math_test/math_test.c" ]
+    deps += [ ":math_demo" ]
+    defines += [ "MATH_TEST" ]
+    include_dirs += [ "math_test" ]
+  }
+
+  if (app_file_test) {
+    sources += [ "file_test/file_test.c" ]
+    deps += [ ":file_demo" ]
+    defines += [ "FILE_TEST" ]
+    include_dirs += [ "file_test" ]
+  }
+
+  if (app_tpm_test) {
+    sources += [ "tpm_test/tpm_test.c" ]
+    deps += [ ":tpm_demo" ]
+    defines += [ "TPM_TEST" ]
+    include_dirs += [ 
+      "tpm_test" ,
+      "//base/security/security_tpm/Platform/include",
+      "//base/security/security_tpm/tpm/include",
+      "//base/security/tpm/tpm/include/public",
+      "//base/security/tpm/tpm/include/platform_interface",
+      "//base/security/tpm/TpmConfiguration/TpmConfiguration",
+      "//base/security/tpm/tpm/include/platform_interface/prototypes",
+    ]
+  }
+
+  if (app_malloc_test) {
+    sources += [ "malloc_test/malloc_test.c" ]
+    deps += [ ":malloc_demo" ]
+    defines += [ "MALLOC_TEST" ]
+    include_dirs += [ "malloc_test" ]
+  }
+
+  if (app_openhitls_sm2_test) {
+    sources += [ "openhitls_test/openhitls_sm2_test.c" ]
+    deps += [ ":openhitls_demo" ]
+    defines += [ "OPENHITLS_SM2_TEST" ]
+    include_dirs += [ "openhitls_test",
+        "openhitls_test",
+        "//kernel/liteos_m/kal/cmsis",
+        "//third_party/openhitls/include/crypto",
+        "//third_party/openhitls/include/bsl",
+        "//third_party/openhitls/crypto/include",
+        "//third_party/openhitls/crypto/sm2/include",
+        "//third_party/openhitls/crypto/sm3/include",
+        "//third_party/openhitls/crypto/sm4/include",
+        "//third_party/openhitls/crypto/ecc/include",
+        "//third_party/openhitls/config/macro_config"
+    ]
+  }
+}   

@@ -1,0 +1,8 @@
+static_library("file_demo") {
+  sources = [ "file_test.c" ]
+
+  include_dirs = [
+      "//kernel/liteos_m/kal/cmsis",
+      "//commonlibrary/utils_lite/include",
+    ]
+}

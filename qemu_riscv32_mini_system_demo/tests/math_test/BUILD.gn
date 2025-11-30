@@ -1,0 +1,12 @@
+static_library("math_demo") {
+  sources = [ "math_test.c" ]
+
+  include_dirs += [
+      "//sample/math_lib/include",
+      "//kernel/liteos_m/kal/cmsis",
+      "//commonlibrary/utils_lite/include",
+    ]
+  external_deps = [
+    "math_lib:math_lib"
+  ]
+}

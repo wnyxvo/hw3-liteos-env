@@ -726,9 +726,16 @@ typedef const bn_point_t *pointConst;
 
 https://wiki.0xffff.one/getting-started/build-env
 
+现在开启
+
++ SM2:
++ SM3：
++ SM4: SM4_128 
++ ALG_CMAC: 
 
 
 
+0000 0000 0000 0101 0000 0000 1111 0010
 
 
 

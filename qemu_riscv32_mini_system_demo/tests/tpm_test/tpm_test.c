@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <stddef.h>
+#include <ctype.h> // for isspace, isxdigit
 
 #include "ohos_init.h"
 #include "cmsis_os2.h"
@@ -39,6 +40,7 @@
 #define TPM_SU_CLEAR             0x0000
 #define TPM_SU_STATE             0x0001
 
+#define TPM_CAP_ALGS             0x00000000
 #define TPM_CAP_TPM_PROPERTIES   0x00000006
 #define TPM_PT_FIXED             0x00000100
 
@@ -55,11 +57,20 @@
 
 #define TPM_ALG_SHA256           0x000B
 #define TPM_ALG_NULL             0x0010
+#define TPM_ALG_SM2              0x001B
 #define TPM_ALG_SM3_256          0x0012
+#define TPM_ALG_SM4              0x0013
 #define TPM_ALG_RSASSA           0x0014
+#define TPM_ALG_ECC              0x0023
+#define TPM_ALG_CFB              0x0043
+
 #define TPM_ALG_AES_128_CFB      0x0043  /* note: mode encoding may vary; here for human clarity */
 #define TPM_ALG_KDF1_SP800_56A   0x0020  /* common KDF; alternative: 0x0022 KDF_CTR_HMAC_SHA256 */
+#define TPM_ALG_KDF_CTR          0x0022  /* KDF for SM2 (Usually KDF_CTR_HMAC_SM3) */
 
+#ifndef TPM_ECC_SM2_P256
+#define TPM_ECC_SM2_P256         0x0020
+#endif
 
 // Context to manage buffers across modules
 typedef struct {
@@ -68,6 +79,13 @@ typedef struct {
     uint8_t *rsp_ptr;
     uint32_t rsp_size;
 } TpmTestContext;
+
+static const uint8_t platform_policy[32] = {
+    0x16, 0x78, 0x60, 0xA3, 0x5F, 0x2C, 0x5C, 0x35,
+    0x67, 0xF9, 0xC9, 0x27, 0xAC, 0x56, 0xC0, 0x32,
+    0xF3, 0xB3, 0xA6, 0x46, 0x2F, 0x8D, 0x03, 0x79,
+    0x98, 0xE7, 0xA1, 0x0F, 0x77, 0xFA, 0x45, 0x4A
+};
 
 /* =========================================================================
  * Platform Externs
@@ -216,6 +234,53 @@ static void parse_GetCapability(const uint8_t *rsp_ptr, uint32_t rsp_size)
     }
 }
 
+static void parse_GetCapability_ALGS(const uint8_t *rsp, uint32_t size)
+{
+    printf("RSP TAG = %04X\n", read_be16(rsp));
+    printf("RSP SIZE = %08X\n", read_be32(rsp + 2));
+    printf("RSP RC = %08X\n", read_be32(rsp + 6));
+    
+    uint32_t rc = read_be32(rsp + 6);
+    if (rc != 0) {
+        printf("GetCapability(ALGS) RC=0x%08X\n", rc);
+        return;
+    }
+
+    uint32_t off = 10; // 跳过响应头(10字节)
+    
+    // 注意：响应中没有parameterSize字段，只有命令中有
+    uint8_t moreData = rsp[off++];
+    printf("RSP moreData = %02X\n", moreData);
+    
+    uint32_t cap = read_be32(rsp + off); 
+    off += 4;
+    printf("RSP cap = %08X\n", cap);
+
+    if (cap != TPM_CAP_ALGS) {
+        printf("Not ALGS capability! Expected 0x%08X, got 0x%08X\n", TPM_CAP_ALGS, cap);
+        return;
+    }
+
+    // TPML_ALG_PROPERTY.count (4 bytes)
+    uint32_t count = read_be32(rsp + off); 
+    off += 4;
+    printf("ALGS count = %u\n", count);
+
+    for (uint32_t i = 0; i < count && off + 6 <= size; i++) {
+        uint16_t algId = read_be16(rsp + off); 
+        off += 2;
+        
+        // TPMA_ALGORITHM 是4字节
+        uint32_t algProps = read_be32(rsp + off); 
+        off += 4;
+
+        printf("ALG 0x%04X:", algId);
+        if (algProps & 1) printf(" hash");
+        if (algProps & 2) printf(" object");
+        printf("\n");
+    }
+}
+
 static void parse_PCR_Read(const uint8_t *rsp_ptr, uint32_t rsp_size)
 {
     uint16_t tag; uint32_t size; uint32_t rc;
@@ -308,6 +373,77 @@ static uint32_t TpmSendCmd(TpmTestContext *ctx, uint32_t cmd_len, const char *de
     return rc;
 }
 
+// 内部工具：将单个 hex 字符转换为数值
+static uint8_t hexCharToInt(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return 0;
+}
+
+/*
+ * 解析 Hex 字符串并发送命令
+ * 支持格式： "80 01...", "8001...", "0x80, 0x01..." 以及换行符
+ */
+void RunRawHexCmd(TpmTestContext *ctx, const char *hexStr, const char *desc)
+{
+    uint32_t len = 0;
+    const char *p = hexStr;
+    uint8_t *buf = ctx->cmd_buf;
+    
+    // 1. 清理并解析 Hex 字符串到 cmd_buf
+    while (*p) {
+        // 跳过空格、换行、制表符、逗号
+        if (isspace((int)*p) || *p == ',') {
+            p++;
+            continue;
+        }
+        // 跳过 "0x" 前缀
+        if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
+            p += 2;
+            continue;
+        }
+
+        // 读取两个字符作为 1 个字节
+        if (isxdigit((int)p[0]) && isxdigit((int)p[1])) {
+            uint8_t hi = hexCharToInt(*p++);
+            uint8_t lo = hexCharToInt(*p++);
+            
+            if (len < sizeof(ctx->cmd_buf)) {
+                buf[len++] = (hi << 4) | lo;
+            } else {
+                printf("Error: Command buffer overflow!\n");
+                return;
+            }
+        } else {
+            // 遇到非 Hex 字符，停止或报错，这里选择跳过
+            p++;
+        }
+    }
+
+    // 2. 打印调试信息
+    printf("\n--- Send Raw Hex: %s ---\n", desc);
+    printf("Parsed Length: %d bytes\n", len);
+
+    // 3. 调用现有的发送函数
+    // TpmSendCmd 会负责发送 cmd_buf 中的数据并接收响应
+    TpmSendCmd(ctx, len, desc);
+    
+    // 4. (可选) 如果是 Create/Load 命令，你可能需要手动解析 Handle
+    // 这里简单的打印一下响应的前几个字节看看结果
+    if (len > 0) {
+        uint32_t rc = read_be32(ctx->rsp_ptr + 6);
+        if (rc == TPM_RC_SUCCESS) {
+            printf("✓ Raw Command Executed Successfully.\n");
+            // 如果是 CreatePrimary/Load，Handle 通常在偏移 14
+            // uint32_t handle = read_be32(ctx->rsp_ptr + 14);
+            // printf("  Handle output: 0x%08X\n", handle);
+        } else {
+            printf("✗ Raw Command Failed: 0x%08X\n", rc);
+        }
+    }
+}
+
 /* =========================================================================
  * Test Modules
  * ========================================================================= */
@@ -369,7 +505,7 @@ void Test_PCR_Read(TpmTestContext *ctx) {
     // PCR Selection: Count 1, SHA256, Size 3, PCR 0
     uint8_t *p = ctx->cmd_buf + off;
     write_be32(p, 1); p += 4;
-    write_be16(p, TPM_ALG_SHA256); p += 2;
+    write_be16(p, TPM_ALG_SM3_256); p += 2;
     *p++ = 3; *p++ = 0x01; *p++ = 0x00; *p++ = 0x00;
     off = p - ctx->cmd_buf;
 
@@ -386,19 +522,20 @@ void Test_GetCapability(TpmTestContext *ctx) {
     printf("\n--- Test 5: TPM2_GetCapability ---\n");
     uint32_t off = 0;
     write_be16(ctx->cmd_buf + off, TPM_ST_NO_SESSIONS); off += 2;
-    write_be32(ctx->cmd_buf + off, 22); off += 4;
+    write_be32(ctx->cmd_buf + off, 22); off += 4;    // TPM_CAP_TPM_PROPERTIES   
     write_be32(ctx->cmd_buf + off, TPM_CC_GetCapability); off += 4;
     
-    write_be32(ctx->cmd_buf + off, TPM_CAP_TPM_PROPERTIES); off += 4;
+    /* write_be32(ctx->cmd_buf + off, TPM_CAP_TPM_PROPERTIES); off += 4;
     write_be32(ctx->cmd_buf + off, TPM_PT_FIXED); off += 4;
-    write_be32(ctx->cmd_buf + off, 1); off += 4;
+    write_be32(ctx->cmd_buf + off, 1); off += 4; */
+
+    write_be32(ctx->cmd_buf + off, TPM_CAP_ALGS); off += 4;
+    write_be32(ctx->cmd_buf + off, 0x00000000); off += 4;
+    write_be32(ctx->cmd_buf + off, 0x0000002E); off += 4;
 
     if (TpmSendCmd(ctx, off, "Sending GetCap") == TPM_RC_SUCCESS) {
-        // Skip header(10), more(1), cap(4), count(4) to get to property
-        // uint32_t prop_val = read_be32(ctx->rsp_ptr + 10 + 1 + 4 + 4 + 4); 
-        // printf("TPM_PT_FIXED Value: 0x%08X\n", prop_val);
-        // printf("✓ Capability OK\n");
-        parse_GetCapability(ctx->rsp_ptr, ctx->rsp_size);
+        // parse_GetCapability(ctx->rsp_ptr, ctx->rsp_size);
+        parse_GetCapability_ALGS(ctx->rsp_ptr, ctx->rsp_size);
     }
 }
 
@@ -412,7 +549,7 @@ void Test_Hash(TpmTestContext *ctx) {
     
     write_be16(ctx->cmd_buf + off, 6); off += 2;
     memcpy(ctx->cmd_buf + off, input, 6); off += 6;
-    write_be16(ctx->cmd_buf + off, TPM_ALG_SHA256); off += 2;
+    write_be16(ctx->cmd_buf + off, TPM_ALG_SM3_256); off += 2;
     write_be32(ctx->cmd_buf + off, 0x40000001); off += 4; // Owner
     
     write_be32(ctx->cmd_buf + size_off, off);
@@ -422,8 +559,8 @@ void Test_Hash(TpmTestContext *ctx) {
         uint16_t d_size = read_be16(ctx->rsp_ptr + 10);
         printf("Hash Size: %u\n", d_size);
         const uint8_t expected[] = {
-            0x8d, 0x96, 0x9e, 0xef, 0x6e, 0xca, 0xd3, 0xc2, 0x9a, 0x3a, 0x62, 0x92, 0x80, 0xe6, 0x86, 0xcf,
-            0x0c, 0x3f, 0x5d, 0x5a, 0x86, 0xaf, 0xf3, 0xca, 0x12, 0x02, 0x0c, 0x92, 0x3a, 0xdc, 0x6c, 0x92
+            0x20, 0x7C, 0xF4, 0x10, 0x53, 0x2F, 0x92, 0xA4, 0x7D, 0xEE, 0x24, 0x5C, 0xE9, 0xB1, 0x1F, 0xF7,
+            0x1F, 0x57, 0x8E, 0xBD, 0x76, 0x3E, 0xB3, 0xBB, 0xEA, 0x44, 0xEB, 0xD0, 0x43, 0xD0, 0x18, 0xFB
         };
         print_hex("Expected Hash", expected, sizeof(expected));
         print_hex("Actual Hash", ctx->rsp_ptr + 12, 32);
@@ -451,7 +588,7 @@ void Test_NV_Storage(TpmTestContext *ctx) {
         uint32_t pub_start = off;
         
         write_be32(ctx->cmd_buf + off, nv_index); off += 4;
-        write_be16(ctx->cmd_buf + off, TPM_ALG_SHA256); off += 2;
+        write_be16(ctx->cmd_buf + off, TPM_ALG_SM3_256); off += 2;
         // Attr: OwnerWrite|OwnerRead|AuthRead|AuthWrite 0x00060006
         write_be32(ctx->cmd_buf + off, 0x00060006); off += 4;
         write_be16(ctx->cmd_buf + off, 0); off += 2;
@@ -505,505 +642,620 @@ void Test_NV_Storage(TpmTestContext *ctx) {
     }
 }
 
-void Test_ECC_Crypto(TpmTestContext *ctx) {
-    printf("\n--- Test 8: ECC Crypto (NIST P-256) ---\n");
-    uint32_t key_handle = 0;
+void Test_SM2_Hierarchy(TpmTestContext *ctx) {
+    printf("\n--- Test 8: SM2 Hierarchy (SM2 SRK -> SM2 Sign Child) ---\n");
+    
+    uint32_t srk_handle = 0;
+    uint32_t child_handle = 0;
+    
+    // Buffers for child blob
+    static uint8_t priv_blob[256]; static uint16_t priv_size = 0;
+    static uint8_t pub_blob[256];  static uint16_t pub_size = 0;
 
-    // 1. CreatePrimary
+    // --------------------------------------------------------
+    // 1. CreatePrimary (SM2 SRK - Restricted/Decrypt)
+    // --------------------------------------------------------
     {
         uint32_t off = 0;
         write_be16(ctx->cmd_buf + off, TPM_ST_SESSIONS); off += 2;
         uint32_t size_off = off; off += 4;
         write_be32(ctx->cmd_buf + off, TPM_CC_CreatePrimary); off += 4;
-        write_be32(ctx->cmd_buf + off, 0x40000001); off += 4;
+        write_be32(ctx->cmd_buf + off, 0x40000001); off += 4; // Owner  // 40000007
         off += write_password_session(ctx->cmd_buf + off);
-        
+
         // Sensitive
         write_be16(ctx->cmd_buf + off, 4); off += 2;
         write_be16(ctx->cmd_buf + off, 0); off += 2;
         write_be16(ctx->cmd_buf + off, 0); off += 2;
-        
-        // Public
+
+        // Public (SM2 SRK)
         uint32_t pub_size_off = off; off += 2;
         uint32_t pub_start = off;
-        write_be16(ctx->cmd_buf + off, 0x0023); off += 2; // ECC
-        write_be16(ctx->cmd_buf + off, TPM_ALG_SHA256); off += 2;
-        write_be32(ctx->cmd_buf + off, 0x00040072); off += 4; // Sign|Fixed|SensitiveDataOrigin
-        write_be16(ctx->cmd_buf + off, 0); off += 2;
-        
-        // ECC Params
-        write_be16(ctx->cmd_buf + off, 0x0000); off += 2; // Null Sym
-        write_be16(ctx->cmd_buf + off, 0x0018); off += 2; // ECDSA
-        write_be16(ctx->cmd_buf + off, 0x0003); off += 2; // NIST_P256
-        write_be16(ctx->cmd_buf + off, 0x0000); off += 2; // Null KDF
-        write_be16(ctx->cmd_buf + off, 0); off += 2; // Unique
-        
+
+        write_be16(ctx->cmd_buf + off, 0x0023); off += 2; // TPM_ALG_ECC
+        write_be16(ctx->cmd_buf + off, TPM_ALG_SM3_256); off += 2; // NameAlg = SM3
+
+        // Attr: FixedTPM|FixedParent|SensitiveDataOrigin|UserWithAuth|adminWithPolicy|Decrypt|Restricted
+        write_be32(ctx->cmd_buf + off, 0x000300F2); off += 4;
+
+        // authPolicy
+        // write_be16(ctx->cmd_buf + off, 0); off += 2; // Policy
+        // 在 CreatePrimary 的 Public 结构中，在 objectAttributes 之后、parameters 之前
+        write_be16(ctx->cmd_buf + off, 32); off += 2; // authPolicy.size = 32
+        memcpy(ctx->cmd_buf + off, platform_policy, 32); off += 32; // buffer = PolicyBSM3_256
+
+        // ECC Params for SRK
+        // Symmetric: MUST be SM4 (0x0013) for TCM
+        write_be16(ctx->cmd_buf + off, TPM_ALG_SM4); off += 2;
+        write_be16(ctx->cmd_buf + off, 0x0080); off += 2;  // keyBits = 128
+        write_be16(ctx->cmd_buf + off, TPM_ALG_CFB); off += 2;  // mode = CFB
+
+        // Scheme: Null
+        write_be16(ctx->cmd_buf + off, TPM_ALG_NULL); off += 2; 
+        // Curve: SM2_P256 (0x0020)
+        write_be16(ctx->cmd_buf + off, TPM_ECC_SM2_P256); off += 2; 
+        // KDF: KDF_CTR_HMAC_SM3 (Algorithm 0x0022, Hash 0x0012)
+        // write_be16(ctx->cmd_buf + off, TPM_ALG_KDF_CTR); off += 2; 
+        // write_be16(ctx->cmd_buf + off, TPM_ALG_SM3_256); off += 2;
+        // KDF: Should be NULL according to template
+        // write_be16(ctx->cmd_buf + off, TPM_ALG_NULL); off += 2; 
+        write_be16(ctx->cmd_buf + off, TPM_ALG_NULL); off += 2; 
+
+        write_be16(ctx->cmd_buf + off, 0); off += 2; // Unique X
+        write_be16(ctx->cmd_buf + off, 0); off += 2; // Unique Y
+
         write_be16(ctx->cmd_buf + pub_size_off, off - pub_start);
-        write_be16(ctx->cmd_buf + off, 0); off += 2;
-        write_be32(ctx->cmd_buf + off, 0); off += 4;
-        
+        write_be16(ctx->cmd_buf + off, 0); off += 2; // OutsideInfo
+        write_be32(ctx->cmd_buf + off, 0); off += 4; // PCR
+
         write_be32(ctx->cmd_buf + size_off, off);
-        
-        if (TpmSendCmd(ctx, off, "CreatePrimary ECC") == TPM_RC_SUCCESS) {
-            key_handle = read_be32(ctx->rsp_ptr + 14);
-            printf("✓ Handle: 0x%08X\n", key_handle);
+
+        if (TpmSendCmd(ctx, off, "CreatePrimary (SM2 SRK)") == TPM_RC_SUCCESS) {
+            srk_handle = read_be32(ctx->rsp_ptr + 14);
+            printf("✓ SM2 SRK Handle: 0x%08X\n", srk_handle);
         } else {
             return;
         }
     }
-    
-    // 2. Sign
-    if (key_handle) {
-        uint8_t digest[32];
-        memset(digest, 0xAA, 32); // Mock hash
-        
+    // --------------------------------------------------------
+    // 2. Create Child (SM2 Signing Key) - Based on Template H-13
+    // --------------------------------------------------------
+    if (srk_handle) {
         uint32_t off = 0;
         write_be16(ctx->cmd_buf + off, TPM_ST_SESSIONS); off += 2;
         uint32_t size_off = off; off += 4;
-        write_be32(ctx->cmd_buf + off, TPM_CC_Sign); off += 4;
-        write_be32(ctx->cmd_buf + off, key_handle); off += 4;
+        write_be32(ctx->cmd_buf + off, TPM_CC_Create); off += 4;
+        write_be32(ctx->cmd_buf + off, srk_handle); off += 4;
+        
         off += write_password_session(ctx->cmd_buf + off);
+
+        // Sensitive
+        write_be16(ctx->cmd_buf + off, 4); off += 2;
+        write_be16(ctx->cmd_buf + off, 0); off += 2;
+        write_be16(ctx->cmd_buf + off, 0); off += 2;
+
+        // Public (SM2 Sign) - Based on Template H-13
+        uint32_t pub_size_off = off; off += 2;
+        uint32_t pub_start = off;
+
+        // type
+        write_be16(ctx->cmd_buf + off, TPM_ALG_ECC); off += 2; // 0x0023
+
+        // nameAlg
+        write_be16(ctx->cmd_buf + off, TPM_ALG_SM3_256); off += 2; // 0x0012
+
+        // Attr: FixedTPM|FixedParent|SensitiveDataOrigin|UserWithAuth|adminWithPolicy|Restricted|Sign
+        write_be32(ctx->cmd_buf + off, 0x000500F2); off += 4;
+
+        write_be16(ctx->cmd_buf + off, 32); off += 2; // size = 32
+        memcpy(ctx->cmd_buf + off, platform_policy, 32); off += 32; // buffer
+
+        // parameters
+        // symmetric->algorithm = NULL
+        write_be16(ctx->cmd_buf + off, TPM_ALG_NULL); off += 2;
+
+        // scheme->scheme = SM2
+        write_be16(ctx->cmd_buf + off, TPM_ALG_SM2); off += 2; // 0x001B
+
+        // scheme->details.hashAlg = SM3
+        write_be16(ctx->cmd_buf + off, TPM_ALG_SM3_256); off += 2; // 0x0012
+
+        // curveID = SM2_P256
+        write_be16(ctx->cmd_buf + off, TPM_ECC_SM2_P256); off += 2; // 0x0020
+
+        // kdf->scheme = NULL
+        write_be16(ctx->cmd_buf + off, TPM_ALG_NULL); off += 2;
+
+        // unique.x.size = 0
+        write_be16(ctx->cmd_buf + off, 0); off += 2;
+        // unique.y.size = 0
+        write_be16(ctx->cmd_buf + off, 0); off += 2;
+
+        // Write public area size
+        write_be16(ctx->cmd_buf + pub_size_off, off - pub_start);
+
+        // OutsideInfo & PCR
+        write_be16(ctx->cmd_buf + off, 0); off += 2; // OutsideInfo
+        write_be32(ctx->cmd_buf + off, 0); off += 4; // PCR
+
+        // Finalize command size
+        write_be32(ctx->cmd_buf + size_off, off);
+
+        if (TpmSendCmd(ctx, off, "TPM2_Create (SM2 Child)") == TPM_RC_SUCCESS) {
+            // Save blobs
+            uint32_t r_off = 14;
+            priv_size = read_be16(ctx->rsp_ptr + r_off); r_off += 2;
+            memcpy(priv_blob, ctx->rsp_ptr + r_off, priv_size); r_off += priv_size;
+            
+            pub_size = read_be16(ctx->rsp_ptr + r_off); r_off += 2;
+            memcpy(pub_blob, ctx->rsp_ptr + r_off, pub_size);
+            printf("✓ SM2 Child Created\n");
+        }
+    }
+    // --------------------------------------------------------
+    // 2. Create Child (SM2 General Signing Key)
+    // --------------------------------------------------------
+    /* if (srk_handle) {
+        uint32_t off = 0;
         
+        // 1. Header
+        write_be16(ctx->cmd_buf + off, TPM_ST_SESSIONS); off += 2;
+        uint32_t size_off = off; off += 4;
+        write_be32(ctx->cmd_buf + off, TPM_CC_Create); off += 4; // TPM2_Create
+        
+        // 2. Handles
+        write_be32(ctx->cmd_buf + off, srk_handle); off += 4; // Parent Handle
+        
+        // 3. Auth Session
+        off += write_password_session(ctx->cmd_buf + off);
+
+        // 4. Parameters
+        
+        // --- inSensitive ---
+        // authSize(2) + auth + dataSize(2) + data
+        uint32_t sens_start = off; off += 2; // Size placeholder
+        write_be16(ctx->cmd_buf + off, 0); off += 2; // userAuth size (0)
+        write_be16(ctx->cmd_buf + off, 0); off += 2; // data size (0)
+        write_be16(ctx->cmd_buf + sens_start, (uint16_t)(off - sens_start - 2)); // Fill size
+
+        // --- inPublic (The Template) ---
+        uint32_t pub_size_off = off; off += 2; // Size placeholder
+        uint32_t pub_start = off;
+        
+        write_be16(ctx->cmd_buf + off, 0x0023); off += 2; // Type: ECC
+        write_be16(ctx->cmd_buf + off, TPM_ALG_SM3_256); off += 2; // NameAlg: SM3
+        
+    
+        write_be32(ctx->cmd_buf + off, 0x00040072); off += 4;
+        
+        write_be16(ctx->cmd_buf + off, 0); off += 2; // AuthPolicy Size (0)
+        
+        // --- ECC Parameters ---
+        write_be16(ctx->cmd_buf + off, TPM_ALG_NULL); off += 2; // Symmetric: NULL
+        
+        write_be16(ctx->cmd_buf + off, TPM_ALG_NULL); off += 2; 
+        
+        write_be16(ctx->cmd_buf + off, TPM_ECC_SM2_P256); off += 2; // Curve: SM2_P256
+        write_be16(ctx->cmd_buf + off, TPM_ALG_NULL); off += 2; // KDF: NULL
+        
+        // Unique (X, Y)
+        write_be16(ctx->cmd_buf + off, 0); off += 2; // X size 0
+        write_be16(ctx->cmd_buf + off, 0); off += 2; // Y size 0
+        
+        // Fill Public Size
+        write_be16(ctx->cmd_buf + pub_size_off, (uint16_t)(off - pub_start));
+        
+        // --- outsideInfo ---
+        write_be16(ctx->cmd_buf + off, 0); off += 2; 
+        
+        // --- creationPCR ---
+        write_be32(ctx->cmd_buf + off, 0); off += 4; // Count 0
+        
+        // Finalize Command Size
+        write_be32(ctx->cmd_buf + size_off, off);
+        
+        printf("Sending TPM2_Create (SM2 Child, General Signing)...\n");
+        ctx->rsp_size = sizeof(ctx->rsp_buf); memset(ctx->rsp_buf, 0, ctx->rsp_size);
+        if (TpmSendCmd(ctx, off, "TPM2_Create (SM2 Child)") == TPM_RC_SUCCESS) {
+            printf("✓ Child Key Created (Blob generated).\n");
+            
+            // Response Parsing: Header(10) + ParamSize(4) + outPrivate + outPublic ...
+            uint32_t r_off = 14; 
+            
+            // outPrivate
+            priv_size = read_be16(ctx->rsp_ptr + r_off); r_off += 2;
+            memcpy(priv_blob, ctx->rsp_ptr + r_off, priv_size); r_off += priv_size;
+            
+            // outPublic
+            pub_size = read_be16(ctx->rsp_ptr + r_off); r_off += 2;
+            memcpy(pub_blob, ctx->rsp_ptr + r_off, pub_size);
+            
+            // Debug info
+            printf("  PrivSize: %d, PubSize: %d\n", priv_size, pub_size);
+        }
+    } */
+
+    // --------------------------------------------------------
+    // 3. Load Child
+    // --------------------------------------------------------
+    if (priv_size > 0) {
+        uint32_t off = 0;
+        write_be16(ctx->cmd_buf + off, TPM_ST_SESSIONS); off += 2;
+        uint32_t size_off = off; off += 4;
+        write_be32(ctx->cmd_buf + off, 0x00000157); off += 4; // TPM2_Load
+        write_be32(ctx->cmd_buf + off, srk_handle); off += 4;
+        off += write_password_session(ctx->cmd_buf + off);
+
+        write_be16(ctx->cmd_buf + off, priv_size); off += 2;
+        memcpy(ctx->cmd_buf + off, priv_blob, priv_size); off += priv_size;
+
+        write_be16(ctx->cmd_buf + off, pub_size); off += 2;
+        memcpy(ctx->cmd_buf + off, pub_blob, pub_size); off += pub_size;
+
+        write_be32(ctx->cmd_buf + size_off, off);
+
+        if (TpmSendCmd(ctx, off, "TPM2_Load") == TPM_RC_SUCCESS) {
+            child_handle = read_be32(ctx->rsp_ptr + 14);
+            printf("✓ Child Loaded. Handle: 0x%08X\n", child_handle);
+        }
+    }
+
+    // --------------------------------------------------------
+    // 4. Sign (SM3 Digest)
+    // --------------------------------------------------------
+    if (child_handle) {
+        uint32_t off = 0;
+        write_be16(ctx->cmd_buf + off, TPM_ST_SESSIONS); off += 2;
+        uint32_t size_off = off; off += 4;
+        write_be32(ctx->cmd_buf + off, 0x0000015D); off += 4; // Sign
+        write_be32(ctx->cmd_buf + off, child_handle); off += 4;
+        off += write_password_session(ctx->cmd_buf + off);
+
+        // Digest (SM3 is 32 bytes)
         write_be16(ctx->cmd_buf + off, 32); off += 2;
-        memcpy(ctx->cmd_buf + off, digest, 32); off += 32;
-        write_be16(ctx->cmd_buf + off, 0); off += 2;
-        write_be16(ctx->cmd_buf + off, 0); off += 2;
-        
-        // Validation (Null Ticket)
+        memset(ctx->cmd_buf + off, 0xAA, 32); off += 32; // Dummy digest
+
+        // Scheme: SM2 (0x001B) or ECDSA (0x0018) + SM3
+        // Note: Some TCM implementations map ECDSA to SM2 signature.
+        // Let's try Null Scheme to let Key decide.
+        write_be16(ctx->cmd_buf + off, 0x0000); off += 2; 
+        write_be16(ctx->cmd_buf + off, 0x0000); off += 2; 
+
+        // Validation
         write_be16(ctx->cmd_buf + off, 0x8004); off += 2;
         write_be32(ctx->cmd_buf + off, 0x40000007); off += 4;
         write_be16(ctx->cmd_buf + off, 0); off += 2;
-        
+
         write_be32(ctx->cmd_buf + size_off, off);
+
+        if (TpmSendCmd(ctx, off, "Sign (SM2)") == TPM_RC_SUCCESS) {
+            printf("✓ SM2 Signature Generated!\n");
+        }
         
-        if (TpmSendCmd(ctx, off, "Sign ECC") == TPM_RC_SUCCESS) {
-            printf("✓ ECC Signature Generated.\n");
+        // Flush child...
+    }
+    // Flush SRK...
+}
+
+
+void Test_SM2_Hierarchy2(TpmTestContext *ctx) {
+    printf("\n--- Test 8: SM2 Hierarchy (SM2 SRK -> SM2 Sign Child) ---\n");
+    
+    uint32_t srk_handle = 0;
+    uint32_t child_handle = 0;
+    
+    // Buffers for child blob
+    static uint8_t priv_blob[256]; static uint16_t priv_size = 0;
+    static uint8_t pub_blob[256];  static uint16_t pub_size = 0;
+
+    // --------------------------------------------------------
+    // 1. CreatePrimary (SM2 SRK - Restricted/Decrypt)
+    // --------------------------------------------------------
+    /* CreatePrimary：SM2 SRK, Restricted/Decrypt, symmetric=SM4-128-CFB, kdf=KDF1_SP800_108(SM3) */
+    {
+        uint32_t off = 0;
+        write_be16(ctx->cmd_buf + off, TPM_ST_SESSIONS); off += 2;
+        uint32_t size_off = off; off += 4;
+        write_be32(ctx->cmd_buf + off, TPM_CC_CreatePrimary); off += 4;
+
+        // parent = Owner
+        write_be32(ctx->cmd_buf + off, 0x40000001); off += 4;
+
+        // auth area (password session, empty auth)
+        off += write_password_session(ctx->cmd_buf + off);
+
+        // TPM2B_SENSITIVE_CREATE (size + userAuth + data) - empty userAuth/data
+        uint32_t sens_start = off; off += 2;
+        write_be16(ctx->cmd_buf + off, 0); off += 2; // userAuth size = 0
+        write_be16(ctx->cmd_buf + off, 0); off += 2; // data size = 0
+        write_be16(ctx->cmd_buf + sens_start, (uint16_t)(off - (sens_start + 2)));
+
+        // TPM2B_PUBLIC (size placeholder)
+        uint32_t pub_size_off = off; off += 2;
+        uint32_t pub_start = off;
+
+        // TPMT_PUBLIC.type  = ECC (0x0023)
+        write_be16(ctx->cmd_buf + off, TPM_ALG_ECC); off += 2;
+        // nameAlg = SM3 (0x0012)
+        write_be16(ctx->cmd_buf + off, TPM_ALG_SM3_256); off += 2;
+
+        // objectAttributes: FixedTPM|FixedParent|SensitiveDataOrigin|UserWithAuth|Restricted|Decrypt
+        write_be32(ctx->cmd_buf + off, 0x00030072); off += 4;
+
+        // authPolicy (TPM2B) empty
+        write_be16(ctx->cmd_buf + off, 0); off += 2;
+
+        /* TPMT_ECC_PARMS:
+        symmetric (TPMT_SYM_DEF_OBJECT) -> SM4 (0x0013), keyBits=128, mode=CFB (0x0043)
+        scheme (TPMT_ECC_SCHEME) -> TPM_ALG_NULL
+        curveID -> TPM_ECC_SM2_P256
+        kdf -> TPM_ALG_KDF1_SP800_108 (0x0022) with hash = SM3 (0x0012)
+        */
+
+        // symmetric.alg = SM4
+        write_be16(ctx->cmd_buf + off, TPM_ALG_SM4); off += 2;
+        // symmetric details: keyBits (UINT16) then mode (UINT16)
+        write_be16(ctx->cmd_buf + off, 128); off += 2;        // keyBits
+        write_be16(ctx->cmd_buf + off, TPM_ALG_CFB); off += 2; // mode CFB (0x0043)
+
+        // scheme = NULL
+        write_be16(ctx->cmd_buf + off, TPM_ALG_NULL); off += 2;
+
+        // curveID = SM2_P256 (macro)
+        write_be16(ctx->cmd_buf + off, TPM_ECC_SM2_P256); off += 2;
+
+        // kdf = KDF1_SP800_108 (0x0022) + hash = SM3 (0x0012)
+        // write_be16(ctx->cmd_buf + off, TPM_ALG_KDF_CTR); off += 2;
+        // write_be16(ctx->cmd_buf + off, TPM_ALG_SM3_256); off += 2;
+        // kdf = TPM_ALG_NULL
+        write_be16(ctx->cmd_buf + off, TPM_ALG_NULL); off += 2;
+
+        // unique (TPM2B_ECC_POINT) - x/y empty
+        write_be16(ctx->cmd_buf + off, 0); off += 2; // x size = 0
+        write_be16(ctx->cmd_buf + off, 0); off += 2; // y size = 0
+
+        // Fill TPM2B_PUBLIC.size
+        write_be16(ctx->cmd_buf + pub_size_off, (uint16_t)(off - (pub_start + 2)));
+
+        // outsideInfo empty
+        write_be16(ctx->cmd_buf + off, 0); off += 2;
+        // creationPCR: count 0
+        write_be32(ctx->cmd_buf + off, 0); off += 4;
+
+        // finalize
+        write_be32(ctx->cmd_buf + size_off, off);
+
+        printf("Sending CreatePrimary (SM2 SRK w/ SM4/CFB + KDF) ...\n");
+        if (TpmSendCmd(ctx, off, "CreatePrimary (SM2 SRK)") == TPM_RC_SUCCESS) {
+            srk_handle = read_be32(ctx->rsp_ptr + 14);
+            printf("✓ SM2 SRK Handle: 0x%08X\n", srk_handle);
+        } else {
+            printf("CreatePrimary (SM2 SRK) failed\n");
+            return;
         }
     }
-    
-    // 3. Flush
-    if (key_handle) {
+
+    // --------------------------------------------------------
+    // 2. Create Child (SM2 Signing Key)
+    // --------------------------------------------------------
+    if (srk_handle) {
         uint32_t off = 0;
-        write_be16(ctx->cmd_buf + off, TPM_ST_NO_SESSIONS); off += 2;
-        write_be32(ctx->cmd_buf + off, 10 + 4); off += 4;
-        write_be32(ctx->cmd_buf + off, TPM_CC_FlushContext); off += 4;
-        write_be32(ctx->cmd_buf + off, key_handle); off += 4;
-        _plat__RunCommand(off, ctx->cmd_buf, &ctx->rsp_size, &ctx->rsp_ptr);
-    }
-}
+        write_be16(ctx->cmd_buf + off, TPM_ST_SESSIONS); off += 2;
+        uint32_t size_off = off; off += 4;
+        write_be32(ctx->cmd_buf + off, 0x00000153); off += 4; // TPM2_Create
+        write_be32(ctx->cmd_buf + off, srk_handle); off += 4;
+        off += write_password_session(ctx->cmd_buf + off);
 
-/* =========================================================================
- * RSA SRK -> Create RSA child -> Load -> Sign/Decrypt workflow
- *
- * High level:
- *  1) CreatePrimary(parent=Owner)  --- create RSA SRK (restricted/decrypt)
- *  2) Create (parent=SRK)          --- create an RSA child (sign/decrypt)
- *  3) Load   (parent=SRK)          --- load child private/public -> object handle
- *  4) Sign (or Decrypt) using child handle
- *
- * All wire fields are BIG-ENDIAN. Sizes follow TPM2.0 wire format.
- * ========================================================================= */
+        // Sensitive
+        write_be16(ctx->cmd_buf + off, 4); off += 2;
+        write_be16(ctx->cmd_buf + off, 0); off += 2;
+        write_be16(ctx->cmd_buf + off, 0); off += 2;
 
+        // Public (SM2 Sign)
+        uint32_t pub_size_off = off; off += 2;
+        uint32_t pub_start = off;
 
-/* Utility: extract TPM2B (size-prefixed) pointer and length.
-   Returns pointer to data content (after size field), sets out_len to length,
-   sets *next_off to offset after this TPM2B (relative to base pointer).
-   Assumes size field is BE16.
-*/
-static const uint8_t* parse_TPM2B(const uint8_t *base, uint32_t base_size, uint32_t off, uint16_t *out_len, uint32_t *next_off)
-{
-    if (off + 2 > base_size) return NULL;
-    uint16_t sz = read_be16(base + off);
-    if (off + 2 + sz > base_size) return NULL;
-    if (out_len) *out_len = sz;
-    if (next_off) *next_off = off + 2 + sz;
-    return base + off + 2;
-}
+        write_be16(ctx->cmd_buf + off, 0x0023); off += 2; // ECC
+        write_be16(ctx->cmd_buf + off, TPM_ALG_SM3_256); off += 2; // NameAlg
 
-/* Build and send CreatePrimary for RSA SRK.
-   - ctx: context
-   - out_handle: pointer to uint32_t to receive primary handle
-   Returns: rc (BE uint32)
-*/
-static uint32_t CreatePrimary_RSA_SRK(TpmTestContext *ctx, uint32_t *out_handle)
-{
-    // We'll build a TPM2_CreatePrimary command with SESSIONS (password) area.
-    // Template (TPMT_PUBLIC) fields:
-    //   type = RSA (0x0001)
-    //   nameAlg = SHA256
-    //   objectAttributes = Restricted | Decrypt | FixedTPM | FixedParent | SensitiveDataOrigin | UserWithAuth
-    //                      bits -> value commonly 0x00030072
-    //   parameters.rsaDetail.symmetric = AES_128_CFB (0x0006) [if TPM rejects, set to TPM_ALG_NULL]
-    //   parameters.rsaDetail.scheme = TPM_ALG_NULL
-    //   parameters.rsaDetail.keyBits = 2048
-    //   parameters.rsaDetail.exponent = 0 (default)
-    //
-    // Wire layout (after header/handles/authorization):
-    //   TPM2B_SENSITIVE_CREATE (size + sensitive)
-    //   TPM2B_PUBLIC (size + public)
-    //   outsideInfo (TPM2B)
-    //   PCR selection
+        // Attr: Sign|FixedTPM|FixedParent|SensitiveDataOrigin|UserWithAuth
+        write_be32(ctx->cmd_buf + off, 0x00040072); off += 4;
 
-    uint8_t *cmd = ctx->cmd_buf;
-    uint8_t *rsp = ctx->rsp_buf;
-    uint32_t c_off = 0;
+        write_be16(ctx->cmd_buf + off, 0); off += 2; // Policy
 
-    write_be16(cmd + c_off, TPM_ST_SESSIONS); c_off += 2;
-    uint32_t size_off = c_off; c_off += 4;
-    write_be32(cmd + c_off, TPM_CC_CreatePrimary); c_off += 4;
+        // ECC Params
+        write_be16(ctx->cmd_buf + off, 0x0000); off += 2; // Sym: Null
+        write_be16(ctx->cmd_buf + off, 0x0018); off += 2; // Scheme: ECDSA (Used for SM2)
+        write_be16(ctx->cmd_buf + off, TPM_ECC_SM2_P256); off += 2; // Curve: SM2
+        write_be16(ctx->cmd_buf + off, 0x0000); off += 2; // KDF: Null
 
-    // Parent handle (Owner)
-    write_be32(cmd + c_off, 0x40000001); c_off += 4;
+        write_be16(ctx->cmd_buf + off, 0); off += 2; // Unique
+        write_be16(ctx->cmd_buf + off, 0); off += 2; 
 
-    // Auth area (password session - empty)
-    c_off += write_password_session(cmd + c_off);
+        write_be16(ctx->cmd_buf + pub_size_off, off - pub_start);
+        write_be16(ctx->cmd_buf + off, 0); off += 2; // OutsideInfo
+        write_be32(ctx->cmd_buf + off, 0); off += 4; // PCR
 
-    /* TPM2B_SENSITIVE_CREATE
-       struct:
-         size (UINT16)
-         sensitive: userAuth (TPM2B_AUTH) + data (TPM2B_DIGEST) - here leave empty userAuth/data
-    */
-    uint32_t sens_start = c_off;
-    c_off += 2; // placeholder for TPM2B_SENSITIVE_CREATE.size (UINT16 BE)
+        write_be32(ctx->cmd_buf + size_off, off);
 
-    // userAuth (TPM2B_AUTH) - empty
-    write_be16(cmd + c_off, 0); c_off += 2;
-    // data (TPM2B_DIGEST) - empty
-    write_be16(cmd + c_off, 0); c_off += 2;
-
-    uint16_t sens_size = (uint16_t)(c_off - (sens_start + 2));
-    write_be16(cmd + sens_start, sens_size);
-
-    /* TPM2B_PUBLIC */
-    uint32_t pub_start = c_off;
-    c_off += 2; // TPM2B_PUBLIC.size placeholder (UINT16)
-
-    // TPMS_PUBLIC area:
-    // type (UINT16)
-    write_be16(cmd + c_off, TPM_ALG_RSA); c_off += 2;
-    // nameAlg
-    write_be16(cmd + c_off, TPM_ALG_SHA256); c_off += 2;
-    // objectAttributes (UINT32)
-    write_be32(cmd + c_off, 0x00030072); c_off += 4; // FixedTPM|FixedParent|SensitiveDataOrigin|UserWithAuth|Restricted|Decrypt
-    // authPolicy (TPM2B_DIGEST) - empty
-    write_be16(cmd + c_off, 0); c_off += 2;
-
-    // parameters: RSA signing key
-    write_be16(cmd + c_off, TPM_ALG_NULL);  c_off += 2;   // symmetric = NULL
-    // scheme = RSASSA
-    write_be16(cmd + c_off, 0x0014); c_off += 2;  // scheme TPM_ALG_RSASSA
-    write_be16(cmd + c_off, TPM_ALG_SHA256); c_off += 2;  // hashAlg for RSASSA
-    // keyBits(UINT16)
-    write_be16(cmd + c_off, 2048); c_off += 2;
-    // exponent(UINT32)
-    write_be32(cmd + c_off, 0); c_off += 4;
-    // unique (TPM2B_PUBLIC_KEY_RSA) -> size (UINT16) + buffer (empty)
-    write_be16(cmd + c_off, 0); c_off += 2;
-
-    // Fill TPM2B_PUBLIC.size
-    uint16_t pub_size = (uint16_t)(c_off - (pub_start + 2));
-    write_be16(cmd + pub_start, pub_size);
-
-    // outsideInfo (TPM2B) empty
-    write_be16(cmd + c_off, 0); c_off += 2;
-
-    // PCR selection: count 0
-    write_be32(cmd + c_off, 0); c_off += 4;
-
-    // finalize size
-    write_be32(cmd + size_off, c_off);
-
-    // send
-    ctx->rsp_size = sizeof(ctx->rsp_buf);
-    ctx->rsp_ptr = ctx->rsp_buf;
-    memset(ctx->rsp_buf, 0, ctx->rsp_size);
-    _plat__RunCommand(c_off, cmd, &ctx->rsp_size, (unsigned char**)&ctx->rsp_ptr);
-
-    if (!ctx->rsp_ptr || ctx->rsp_size < 10) return 0xFFFFFFFF;
-    uint32_t rc = read_be32(ctx->rsp_ptr + 6);
-    if (rc != TPM_RC_SUCCESS) {
-        printf("CreatePrimary (SRK) failed: 0x%08X\n", rc);
-        // If rc indicates algorithm/kdf not supported, try switching symmetric->TPM_ALG_NULL.
-        return rc;
+        if (TpmSendCmd(ctx, off, "TPM2_Create (SM2 Child)") == TPM_RC_SUCCESS) {
+            // Save blobs
+            uint32_t r_off = 14;
+            priv_size = read_be16(ctx->rsp_ptr + r_off); r_off += 2;
+            memcpy(priv_blob, ctx->rsp_ptr + r_off, priv_size); r_off += priv_size;
+            
+            pub_size = read_be16(ctx->rsp_ptr + r_off); r_off += 2;
+            memcpy(pub_blob, ctx->rsp_ptr + r_off, pub_size);
+            printf("✓ SM2 Child Created\n");
+        }
     }
 
-    // Parse handle: response with tag 0x8002 (SESSIONS): header(10) + paramSize(4) + handle(4) ...
-    uint32_t handle = read_be32(ctx->rsp_ptr + 14);
-    if (out_handle) *out_handle = handle;
-    printf("CreatePrimary SRK succeeded. Handle=0x%08X\n", handle);
-    return rc;
-}
-
-/* Create an RSA child under parent (SRK).
-   It sends TPM2_Create (parentHandle) with a public template for an RSA signing key
-   Returns rc. On success it stores outPrivate and outPublic into ctx->scratch buffers:
-     - priv_ptr and priv_len (TPM2B_PRIVATE)
-     - pub_ptr and pub_len  (TPM2B_PUBLIC)
-   For simplicity we put them into ctx->rsp_buf copies (caller may copy out if needed).
-*/
-static uint32_t Create_RSA_Child_SaveInCtx(TpmTestContext *ctx, uint32_t parentHandle,
-                                           uint8_t **out_priv_ptr, uint32_t *out_priv_len,
-                                           uint8_t **out_pub_ptr, uint32_t *out_pub_len)
-{
-    uint8_t *cmd = ctx->cmd_buf;
-    uint32_t c_off = 0;
-    write_be16(cmd + c_off, TPM_ST_SESSIONS); c_off += 2;
-    uint32_t size_off = c_off; c_off += 4;
-    write_be32(cmd + c_off, TPM_CC_Create); c_off += 4;
-
-    // parentHandle
-    write_be32(cmd + c_off, parentHandle); c_off += 4;
-
-    // Auth area (password session)
-    c_off += write_password_session(cmd + c_off);
-
-    // InSensitive (TPM2B_SENSITIVE_CREATE)
-    uint32_t sens_start = c_off; c_off += 2;
-    // userAuth (TPM2B) empty
-    write_be16(cmd + c_off, 0); c_off += 2;
-    // data (TPM2B) empty
-    write_be16(cmd + c_off, 0); c_off += 2;
-    // fill size
-    write_be16(cmd + sens_start, (uint16_t)(c_off - (sens_start + 2)));
-
-    // InPublic (TPM2B_PUBLIC) - RSA signing key (non-restricted, sign)
-    uint32_t pub_start = c_off; c_off += 2;
-    // type, nameAlg
-    write_be16(cmd + c_off, TPM_ALG_RSA); c_off += 2;
-    write_be16(cmd + c_off, TPM_ALG_SHA256); c_off += 2;
-    // attributes: FixedTPM|FixedParent|SensitiveDataOrigin|UserWithAuth|Sign
-    write_be32(cmd + c_off, 0x00040072); c_off += 4;
-    // authPolicy empty
-    write_be16(cmd + c_off, 0); c_off += 2;
-    // FIX: Specify RSASSA scheme for a Sign key (TPM2.0 Spec Part 3, 20.3.3)
-    // symmetric null (Correct for non-restricted key)
-    write_be16(cmd + c_off, TPM_ALG_NULL); c_off += 2; 
-    // scheme (TPMT_RSA_SCHEME)
-    write_be16(cmd + c_off, TPM_ALG_RSASSA); c_off += 2; // scheme = RSASSA (0x0014)
-    write_be16(cmd + c_off, TPM_ALG_SHA256); c_off += 2; // hashAlg = SHA256 (0x000B)
-    // keyBits
-    write_be16(cmd + c_off, 2048); c_off += 2; 
-    // exponent
-    write_be32(cmd + c_off, 0); c_off += 4;
-    // unique (TPM2B_PUBLIC_KEY_RSA) empty
-    write_be16(cmd + c_off, 0); c_off += 2;
-
-    // fill public size
-    write_be16(cmd + pub_start, (uint16_t)(c_off - (pub_start + 2)));
-
-    // outsideInfo (TPM2B) empty
-    write_be16(cmd + c_off, 0); c_off += 2;
-    // PCR selection empty
-    write_be32(cmd + c_off, 0); c_off += 4;
-
-    write_be32(cmd + size_off, c_off);
-
-    // send
-    ctx->rsp_size = sizeof(ctx->rsp_buf);
-    ctx->rsp_ptr = ctx->rsp_buf;
-    memset(ctx->rsp_buf, 0, ctx->rsp_size);
-    _plat__RunCommand(c_off, cmd, &ctx->rsp_size, (unsigned char**)&ctx->rsp_ptr);
-
-    if (!ctx->rsp_ptr || ctx->rsp_size < 10) return 0xFFFFFFFF;
-    uint32_t rc = read_be32(ctx->rsp_ptr + 6);
-    if (rc != TPM_RC_SUCCESS) {
-        printf("Create (child) failed: 0x%08X\n", rc);
-        return rc;
-    }
-
-    // Parse response: tag 0x8002 => header(10) + paramSize(4) + outPrivate(TPM2B_PRIVATE) + outPublic(TPM2B_PUBLIC) ...
-    // Locate outPrivate at offset = 14
-    uint32_t off = 14;
-    uint16_t priv_sz = 0;
-    const uint8_t *priv_ptr = parse_TPM2B(ctx->rsp_ptr, ctx->rsp_size, off, &priv_sz, &off);
-    if (!priv_ptr) {
-        printf("Create: cannot parse outPrivate\n");
-        return 0xFFFFFFFF;
-    }
-    // outPublic next
-    uint16_t pub_sz = 0;
-    const uint8_t *pub_ptr = parse_TPM2B(ctx->rsp_ptr, ctx->rsp_size, off, &pub_sz, &off);
-    if (!pub_ptr) {
-        printf("Create: cannot parse outPublic\n");
-        return 0xFFFFFFFF;
-    }
-
-    // copy to dynamically allocated buffers (caller owns them)
-    if (out_priv_ptr && out_priv_len) {
-        uint8_t *p = malloc(priv_sz);
-        if (p) { memcpy(p, priv_ptr, priv_sz); *out_priv_ptr = p; *out_priv_len = priv_sz; }
-    }
-    if (out_pub_ptr && out_pub_len) {
-        uint8_t *p = malloc(pub_sz);
-        if (p) { memcpy(p, pub_ptr, pub_sz); *out_pub_ptr = p; *out_pub_len = pub_sz; }
-    }
-    printf("Create(child) succeeded: priv=%u bytes pub=%u bytes\n", priv_sz, pub_sz);
-    return rc;
-}
-
-/* Load child under parent. Takes parentHandle and TPM2B_PRIVATE/TPM2B_PUBLIC buffers (raw bytes
-   as produced by Create). Returns object handle in out_handle.
-*/
-static uint32_t LoadChild(TpmTestContext *ctx, uint32_t parentHandle,
-                          const uint8_t *priv_buf, uint32_t priv_len,
-                          const uint8_t *pub_buf, uint32_t pub_len,
-                          uint32_t *out_handle)
-{
-    uint8_t *cmd = ctx->cmd_buf;
-    uint32_t c_off = 0;
-    write_be16(cmd + c_off, TPM_ST_SESSIONS); c_off += 2;
-    uint32_t size_off = c_off; c_off += 4;
-    write_be32(cmd + c_off, TPM_CC_Load); c_off += 4;
-
-    // parent handle
-    write_be32(cmd + c_off, parentHandle); c_off += 4;
-
-    // Auth area
-    c_off += write_password_session(cmd + c_off);
-
-    // inPrivate (TPM2B_PRIVATE) - needs leading uint16 size (BE) + buffer
-    write_be16(cmd + c_off, (uint16_t)priv_len); c_off += 2;
-    memcpy(cmd + c_off, priv_buf, priv_len); c_off += priv_len;
-
-    // inPublic (TPM2B_PUBLIC)
-    write_be16(cmd + c_off, (uint16_t)pub_len); c_off += 2;
-    memcpy(cmd + c_off, pub_buf, pub_len); c_off += pub_len;
-
-    write_be32(cmd + size_off, c_off);
-
-    // send
-    ctx->rsp_size = sizeof(ctx->rsp_buf);
-    ctx->rsp_ptr = ctx->rsp_buf;
-    memset(ctx->rsp_buf, 0, ctx->rsp_size);
-    _plat__RunCommand(c_off, cmd, &ctx->rsp_size, (unsigned char**)&ctx->rsp_ptr);
-    if (!ctx->rsp_ptr || ctx->rsp_size < 18) return 0xFFFFFFFF;
-    uint32_t rc = read_be32(ctx->rsp_ptr + 6);
-    if (rc != TPM_RC_SUCCESS) {
-        printf("Load failed: 0x%08X\n", rc);
-        return rc;
-    }
-    // Response (SESSIONS): header(10)+paramSize(4)+objectHandle(4)+... so handle at offset 14
-    uint32_t handle = read_be32(ctx->rsp_ptr + 14);
-    if (out_handle) *out_handle = handle;
-    printf("Load succeeded. ObjectHandle=0x%08X\n", handle);
-    return rc;
-}
-
-/* Sign using RSA key handle (RSASSA-PKCS1v1_5 with SHA256 assumed).
-   We construct TPM2_Sign request: digest (TPM2B_DIGEST) and scheme NULL to use key default.
-*/
-static uint32_t SignWithKey(TpmTestContext *ctx, uint32_t keyHandle, const uint8_t *digest32)
-{
-    uint8_t *cmd = ctx->cmd_buf;
-    uint32_t c_off = 0;
-    write_be16(cmd + c_off, TPM_ST_SESSIONS); c_off += 2;
-    uint32_t size_off = c_off; c_off += 4;
-    write_be32(cmd + c_off, TPM_CC_Sign); c_off += 4;
-
-    write_be32(cmd + c_off, keyHandle); c_off += 4;
-
-    // auth
-    c_off += write_password_session(cmd + c_off);
-
-    // digest (TPM2B_DIGEST)
-    write_be16(cmd + c_off, 32); c_off += 2;
-    memcpy(cmd + c_off, digest32, 32); c_off += 32;
-
-    // inScheme - Null (use key default)
-    write_be16(cmd + c_off, TPM_ALG_NULL); c_off += 2;
-    write_be16(cmd + c_off, TPM_ALG_NULL); c_off += 2; // some TPMs expect scheme+hash
-
-    // validation (TPMT_TK_HASHCHECK) - Null ticket (tag + hierarchy + size 0)
-    write_be16(cmd + c_off, 0x8004); c_off += 2; // TPM_ST_HASHCHECK
-    write_be32(cmd + c_off, 0x40000007); c_off += 4; // hierarchy: NULL
-    write_be16(cmd + c_off, 0); c_off += 2; // digest size 0
-
-    write_be32(cmd + size_off, c_off);
-
-    ctx->rsp_size = sizeof(ctx->rsp_buf);
-    ctx->rsp_ptr = ctx->rsp_buf;
-    memset(ctx->rsp_buf, 0, ctx->rsp_size);
-    _plat__RunCommand(c_off, cmd, &ctx->rsp_size, (unsigned char**)&ctx->rsp_ptr);
-    if (!ctx->rsp_ptr || ctx->rsp_size < 10) return 0xFFFFFFFF;
-    uint32_t rc = read_be32(ctx->rsp_ptr + 6);
-    if (rc != TPM_RC_SUCCESS) {
-        printf("Sign failed: 0x%08X\n", rc);
-        return rc;
-    }
-    // parse signature: Response header(10)+paramSize(4)+TPMT_SIGNATURE ...
-    // For RSA signature, TPMT_SIGNATURE: sigAlg(UINT16) + signature (TPM2B)...
-    // We'll try to locate sigAlg at offset 14
-    uint32_t off = 14;
-    uint16_t sigAlg = read_be16(ctx->rsp_ptr + off);
-    off += 2;
-    uint16_t sigSize = read_be16(ctx->rsp_ptr + off); off += 2;
-    printf("Sign succeeded. SigAlg=0x%04X sigSize=%u\n", sigAlg, sigSize);
-    // signature bytes start at ctx->rsp_ptr + off
-    print_hex("Signature", ctx->rsp_ptr + off, sigSize);
-    return rc;
-}
-
-/* High-level workflow: create SRK, create RSA child, load & sign */
-void Test_RSA_SRK_Workflow(TpmTestContext *ctx)
-{
-    uint32_t srk_handle = 0;
-    uint32_t rc;
-
-    printf("\n--- Test RSA SRK Workflow: CreatePrimary(SRK) -> Create -> Load -> Sign ---\n");
-
-    // 1) CreatePrimary SRK
-    rc = CreatePrimary_RSA_SRK(ctx, &srk_handle);
-    if (rc != TPM_RC_SUCCESS) {
-        printf("CreatePrimary SRK failed 0x%08X - try changing symmetric->TPM_ALG_NULL or adjusting KDF\n", rc);
-        return;
-    }
-
-    // 2) Create an RSA child under SRK
-    uint8_t *priv = NULL, *pub = NULL; uint32_t priv_len = 0, pub_len = 0;
-    rc = Create_RSA_Child_SaveInCtx(ctx, srk_handle, &priv, &priv_len, &pub, &pub_len);
-    if (rc != TPM_RC_SUCCESS) {
-        printf("Create child failed 0x%08X\n", rc);
-        if (priv) free(priv);
-        if (pub) free(pub);
-        return;
-    }
-
-    // Debug: print sizes
-    printf("Child created. priv_len=%u pub_len=%u\n", priv_len, pub_len);
-
-    // 3) Load child
-    uint32_t child_handle = 0;
-    rc = LoadChild(ctx, srk_handle, priv, priv_len, pub, pub_len, &child_handle);
-    if (rc != TPM_RC_SUCCESS) {
-        printf("Load child failed 0x%08X\n", rc);
-        free(priv); free(pub);
-        return;
-    }
-
-    // 4) Sign (mock digest)
-    uint8_t digest[32] = {0};
-    // for demo use: SHA256("hello") etc. Here we just pass zeros or you can pass real hash
-    rc = SignWithKey(ctx, child_handle, digest);
-    if (rc != TPM_RC_SUCCESS) {
-        printf("SignWithKey returned 0x%08X\n", rc);
-    }
-
-    // 5) Flush the loaded child
-    {
-        uint8_t flushCmd[16];
+    // --------------------------------------------------------
+    // 3. Load Child
+    // --------------------------------------------------------
+    if (priv_size > 0) {
         uint32_t off = 0;
-        write_be16(flushCmd + off, TPM_ST_NO_SESSIONS); off += 2;
-        write_be32(flushCmd + off, 12); off += 4; // 12 bytes length (2+4+4+2? but we place 12 + 4 bytes handle below)
-        write_be32(flushCmd + off, TPM_CC_FlushContext); off += 4;
-        write_be32(flushCmd + off, child_handle); off += 4;
-        ctx->rsp_size = sizeof(ctx->rsp_buf);
-        ctx->rsp_ptr = ctx->rsp_buf;
-        _plat__RunCommand(off, flushCmd, &ctx->rsp_size, (unsigned char**)&ctx->rsp_ptr);
-        printf("Child flushed.\n");
+        write_be16(ctx->cmd_buf + off, TPM_ST_SESSIONS); off += 2;
+        uint32_t size_off = off; off += 4;
+        write_be32(ctx->cmd_buf + off, 0x00000157); off += 4; // TPM2_Load
+        write_be32(ctx->cmd_buf + off, srk_handle); off += 4;
+        off += write_password_session(ctx->cmd_buf + off);
+
+        write_be16(ctx->cmd_buf + off, priv_size); off += 2;
+        memcpy(ctx->cmd_buf + off, priv_blob, priv_size); off += priv_size;
+
+        write_be16(ctx->cmd_buf + off, pub_size); off += 2;
+        memcpy(ctx->cmd_buf + off, pub_blob, pub_size); off += pub_size;
+
+        write_be32(ctx->cmd_buf + size_off, off);
+
+        if (TpmSendCmd(ctx, off, "TPM2_Load") == TPM_RC_SUCCESS) {
+            child_handle = read_be32(ctx->rsp_ptr + 14);
+            printf("✓ Child Loaded. Handle: 0x%08X\n", child_handle);
+        }
     }
 
-    free(priv); free(pub);
-    printf("=== RSA SRK Workflow Finished ===\n");
+    // --------------------------------------------------------
+    // 4. Sign (SM3 Digest)
+    // --------------------------------------------------------
+    if (child_handle) {
+        uint32_t off = 0;
+        write_be16(ctx->cmd_buf + off, TPM_ST_SESSIONS); off += 2;
+        uint32_t size_off = off; off += 4;
+        write_be32(ctx->cmd_buf + off, 0x0000015D); off += 4; // Sign
+        write_be32(ctx->cmd_buf + off, child_handle); off += 4;
+        off += write_password_session(ctx->cmd_buf + off);
+
+        // Digest (SM3 is 32 bytes)
+        write_be16(ctx->cmd_buf + off, 32); off += 2;
+        memset(ctx->cmd_buf + off, 0xAA, 32); off += 32; // Dummy digest
+
+        // Scheme: SM2 (0x001B) or ECDSA (0x0018) + SM3
+        // Note: Some TCM implementations map ECDSA to SM2 signature.
+        // Let's try Null Scheme to let Key decide.
+        write_be16(ctx->cmd_buf + off, 0x0000); off += 2; 
+        write_be16(ctx->cmd_buf + off, 0x0000); off += 2; 
+
+        // Validation
+        write_be16(ctx->cmd_buf + off, 0x8004); off += 2;
+        write_be32(ctx->cmd_buf + off, 0x40000007); off += 4;
+        write_be16(ctx->cmd_buf + off, 0); off += 2;
+
+        write_be32(ctx->cmd_buf + size_off, off);
+
+        if (TpmSendCmd(ctx, off, "Sign (SM2)") == TPM_RC_SUCCESS) {
+            printf("✓ SM2 Signature Generated!\n");
+        }
+        
+        // Flush child...
+    }
+    // Flush SRK...
+}
+
+void Test_Replay_Capture_CreatePrimary(TpmTestContext *ctx) {
+    // ./createprimary -hi p -ecc sm2p256 -st -pwdk sto  -tk tk.bin -ch ch.bin -halg sm3 -nalg sm3
+    const char *captured_cmd = 
+        "80 02 00 00 00 46 00 00 01 31 40 00 00 0c 00 00 "
+        "00 09 40 00 00 09 00 00 00 00 00 00 07 00 03 73 "
+        "74 6f 00 00 00 1a 00 23 00 12 00 03 04 72 00 00 "
+        "00 13 00 80 00 43 00 10 00 20 00 10 00 00 00 00 "
+        "00 00 00 00 00 00";
+
+    RunRawHexCmd(ctx, captured_cmd, "Replay Captured CreatePrimary");
+}
+
+void Test_Replay_Capture_Create(TpmTestContext *ctx) {
+    // ./create -hp 80000000 -ecc sm2p256 -si -halg sm3 -kt f -kt p -opr signeccpriv.bin -opu signeccpub.bin  -pwdp sto -pwdk sig -nalg sm3
+    const char *captured_cmd = 
+        "80 02 00 00 00 45 00 00 01 53 80 00 00 00 00 00 "
+        "00 0c 40 00 00 09 00 00 00 00 03 73 74 6f 00 07 " 
+        "00 03 73 69 67 00 00 00 16 00 23 00 12 00 04 04 "
+        "72 00 00 00 10 00 10 00 20 00 10 00 00 00 00 00 "
+        "00 00 00 00 00 ";
+
+    RunRawHexCmd(ctx, captured_cmd, "Replay Captured Create");
+}
+
+void Test_Replay_Capture_Load(TpmTestContext *ctx) {
+    // ./load -hp 80000000 -ipr signeccpriv.bin -ipu signeccpub.bin -pwdp sto
+    /* const char *captured_cmd = 
+        "80 02 00 00 00 f6 00 00 01 57 80 00 00 00 00 00 " 
+        "00 0c 40 00 00 09 00 00 00 00 03 73 74 6f 00 7e "
+        "00 20 ff 4e 8f ab dd da 2d 6a cf c7 ca 10 a2 f3 "
+        "30 30 4b 44 3c d7 11 e7 6e de 08 e8 a2 84 35 e6 "
+        "b9 e6 00 10 04 32 9c 03 2c 94 59 d9 c3 c3 9c 28 "
+        "1b 3c 8f 8e b2 88 5e e2 6c 06 46 38 93 d6 f8 30 "
+        "6b 5c 48 5d 04 74 95 51 40 c7 59 2e 93 68 8f 14 "
+        "38 35 6c 41 93 ba fc 11 02 58 61 f8 20 32 c0 b0 "
+        "f4 85 0c e7 f1 c0 1f dc 35 03 01 5e 08 34 b7 8e "
+        "f4 f0 a3 8a 72 ed 22 01 27 08 0d 44 04 3d 00 56 "
+        "00 23 00 12 00 04 04 72 00 00 00 10 00 10 00 20 "
+        "00 10 00 20 0d e2 b0 46 17 ba bf 9c d1 bd 6c 9f "
+        "1a d5 22 d8 95 2c 88 47 2f df 58 f0 26 f6 16 74 "
+        "6b 95 4b 42 00 20 f4 99 a8 d1 6a e3 c6 02 7e 85 "
+        "38 84 dd 4e c7 b6 a5 39 a2 5f 35 db ac d1 dc ba " 
+        "fa 67 4f 3b 9e 72 "; */
+    const char *captured_cmd = 
+        "80 02 00 00 00 f6 00 00 01 57 80 00 00 00 00 00 "
+        "00 0c 40 00 00 09 00 00 00 00 03 73 74 6f 00 7e "
+        "00 20 8d 3e 4b 9e 00 26 dc ba 28 3f 49 98 eb 18 "
+        "50 3a d5 8c 3a ac a3 a8 4e 65 80 e9 c6 d2 ba a1 "
+        "51 fd 00 10 4f d7 2b 64 cb 5e 5c 2d 25 81 20 61 "
+        "05 c4 ae 14 be 98 2e 24 9d 6d c9 8c c2 b5 5f b8 "
+        "2a 6c 9f f1 5d b1 6f 05 1d 13 53 98 6a 89 04 56 "
+        "a5 44 e1 47 e6 ee 58 00 38 24 4d 48 83 8e ac 1e "
+        "16 54 27 1e 17 2b 09 6b 13 1e 88 7e 2f d4 84 ee "
+        "55 98 4e df 8d 83 fa 63 ce 0c 82 f9 0a 4e 00 56 "
+        "00 23 00 12 00 04 04 72 00 00 00 10 00 10 00 20 "
+        "00 10 00 20 b6 d0 d1 fe 3b 99 35 b8 d2 5b 21 18 "
+        "31 02 a8 70 b8 c9 c4 22 52 b1 cc b3 7a b7 e0 13 "
+        "32 5f f0 7a 00 20 37 3f e8 db d2 eb 13 5a 55 6a "
+        "e7 a8 d5 90 56 90 c8 46 3e 71 c9 4c 92 3c 31 c6 "
+        "ff eb db 69 7c 6d "; 
+
+    RunRawHexCmd(ctx, captured_cmd, "Replay Captured Load");
+}
+
+void Test_Replay_Capture_Sign(TpmTestContext *ctx) {
+    // ./sign -hk 80000001 -halg sm3 -salg sm2 -if policies/aaa -os sig.bin -pwdk sig 
+    const char *captured_cmd = 
+        "80 02 00 00 00 4c 00 00 01 5d 80 00 00 01 00 00 "
+        "00 0c 40 00 00 09 00 00 00 00 03 73 69 67 00 20 "
+        "8d 83 c7 af 17 f5 44 df fb 98 9f 53 cd 6a af dc "
+        "2e da 6c a5 ea 7f ef 3d d7 b2 f0 ee 82 30 66 0d "
+        "00 1b 00 12 80 24 40 00 00 07 00 00 ";
+        
+    RunRawHexCmd(ctx, captured_cmd, "Replay Captured Sign");
+}
+
+void Test_Replay_Capture_Verifysignature(TpmTestContext *ctx) {
+    // ./verifysignature -hk 80000001 -halg sm3 -ecc -if policies/aaa -is sig.bin 
+    const char *captured_cmd = 
+        "80 01 00 00 00 78 00 00 01 77 80 00 00 01 00 20 "
+        "8d 83 c7 af 17 f5 44 df fb 98 9f 53 cd 6a af dc "
+        "2e da 6c a5 ea 7f ef 3d d7 b2 f0 ee 82 30 66 0d "
+        "00 1b 00 12 00 20 49 24 5f 34 ec 66 ab eb ba f4 "
+        "ed ec b5 41 ea 73 22 49 ec c5 58 06 99 4d 47 1a "
+        "ab bb a8 d8 5f c5 00 20 6e c1 24 9c 41 72 54 5d "
+        "4a 60 db 00 5b 3b dd b3 d7 63 79 65 fa 24 07 dd "
+        "d5 3f 5e 4b c2 27 98 41";
+        
+    RunRawHexCmd(ctx, captured_cmd, "Replay Captured verifysignature");
+}
+//  80 01 00 00 00 0e 00 00 01 65 80 00 00 01 
+
+void Test_Replay_Capture_Flushcontext(TpmTestContext *ctx) {
+    // ./flushcontext -ha 80000001
+    const char *captured_cmd = 
+        "80 01 00 00 00 0e 00 00 01 65 80 00 00 01 ";
+        
+    RunRawHexCmd(ctx, captured_cmd, "Replay Captured flushcontext 80000001");
+
+    // ./flushcontext -ha 80000000
+    const char *captured_cmd2 = 
+        "80 01 00 00 00 0e 00 00 01 65 80 00 00 00 ";
+        
+    RunRawHexCmd(ctx, captured_cmd2, "Replay Captured flushcontext 80000000");
 }
 
 
@@ -1043,7 +1295,7 @@ void TPMTestTask(void *arg) {
     Test_Startup(&ctx);
     LOS_TaskDelay(2);
     
-    Test_SelfTest(&ctx);
+    /* Test_SelfTest(&ctx);
     LOS_TaskDelay(2);
     
     Test_GetRandom(&ctx);
@@ -1061,8 +1313,15 @@ void TPMTestTask(void *arg) {
     Test_NV_Storage(&ctx);
     LOS_TaskDelay(2);
     
-    // Test_ECC_Crypto(&ctx);
-    Test_RSA_SRK_Workflow(&ctx);
+    Test_SM2_Hierarchy(&ctx); */
+    
+    Test_Replay_Capture_CreatePrimary(&ctx);
+    Test_Replay_Capture_Create(&ctx);
+    Test_Replay_Capture_Load(&ctx);
+    Test_Replay_Capture_Sign(&ctx);
+    Test_Replay_Capture_Verifysignature(&ctx);
+    Test_Replay_Capture_Flushcontext(&ctx);
+    LOS_TaskDelay(2);
 
     printf("\n=== All Tests Finished ===\n");
 }

@@ -10,8 +10,7 @@
     "force_link_libs": [
       "bootstrap",
       "abilityms",
-      "example",
-      "ability_demo"
+      "example"
     ],
     "subsystems": [
       {

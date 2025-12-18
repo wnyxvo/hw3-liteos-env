@@ -20,6 +20,7 @@ declare_args() {
   app_tpm_test = true
   app_malloc_test = false
   app_openhitls_sm2_test = false
+  app_vtpm_test = false
 }
 
 static_library("hello_demo") {
@@ -108,6 +109,16 @@ static_library("openhitls_demo") {
   ]
 }
 
+static_library("vtpm_demo") {
+  sources = [ 
+    "vtpm_test/vtpm_scheduler_test.c", 
+  ]
+
+  include_dirs = [
+    "vtpm_test",
+  ]
+}
+
 static_library("example") {
   sources = [ "app.cpp" ]
   defines = []
@@ -185,5 +196,15 @@ static_library("example") {
         "//third_party/openhitls/crypto/ecc/include",
         "//third_party/openhitls/config/macro_config"
     ]
+  }
+
+  if (app_vtpm_test) {
+    sources += [ "vtpm_test/vtpm_scheduler_test.c", ]
+    deps += [ 
+      ":vtpm_demo",
+      "//kernel/liteos_m/components/exchook:exchook", 
+    ]
+    defines += [ "VTPM_TEST" ]
+    include_dirs += [ "vtpm_test", "//kernel/liteos_m/components/exchook", ]
   }
 }   

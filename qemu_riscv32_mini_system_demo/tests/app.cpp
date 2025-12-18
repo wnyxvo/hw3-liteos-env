@@ -14,7 +14,7 @@
  */
 
 #if defined(UI_TEST) || defined(ABILITY_TEST) || defined(HELLO_TEST) || defined(MATH_TEST) || defined(FILE_TEST) \
-                     || defined(TPM_TEST) || defined(MALLOC_TEST) || defined(OPENHITLS_SM2_TEST)
+                     || defined(TPM_TEST) || defined(MALLOC_TEST) || defined(OPENHITLS_SM2_TEST) || defined(VTPM_TEST)
 #include "ohos_init.h"
 #include "ui_adapter.h"
 
@@ -42,6 +42,9 @@
 #endif
 #if defined(OPENHITLS_SM2_TEST)
     #include "openhitls_sm2_test.h"
+#endif
+#if defined(VTPM_TEST)
+    #include "vtpm_scheduler_test.h"
 #endif
 
 void RunApp(void)
@@ -107,5 +110,14 @@ void AppOpenHiTLSSM2TestEntry(void)
 #endif
 }
 APP_FEATURE_INIT(AppOpenHiTLSSM2TestEntry);
+
+void AppVtpmTestEntry(void)
+{
+#if defined(VTPM_TEST)
+    // CreateVtpmTasks();
+    app_init();
+#endif
+}
+APP_FEATURE_INIT(AppVtpmTestEntry);
 
 #endif

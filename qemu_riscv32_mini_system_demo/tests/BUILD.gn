@@ -17,10 +17,10 @@ declare_args() {
   app_hello_test = false
   app_math_test = false
   app_file_test = false
-  app_tpm_test = true
+  app_tcm_test = true
   app_malloc_test = false
   app_openhitls_sm2_test = false
-  app_vtpm_test = false
+  app_vtcm_test = false
 }
 
 static_library("hello_demo") {
@@ -61,20 +61,20 @@ static_library("file_demo") {
     ]
 }
 
-static_library("tpm_demo") {
-  sources = [ "tpm_test/tpm_test.c" ]
+static_library("tcm_demo") {
+  sources = [ "tcm_test/tcm_test.c" ]
 
   include_dirs = [
-    "tpm_test",
-    "//base/security/tpm/Platform/include",
-    "//base/security/tpm/tpm/include/public",
-    "//base/security/tpm/tpm/include/platform_interface",
-    "//base/security/tpm/TpmConfiguration",
-    "//base/security/tpm/tpm/include/platform_interface/prototypes",
+    "tcm_test",
+    "//base/security/tcm/Platform/include",
+    "//base/security/tcm/tcm/include/public",
+    "//base/security/tcm/tcm/include/platform_interface",
+    "//base/security/tcm/TcmConfiguration",
+    "//base/security/tcm/tcm/include/platform_interface/prototypes",
   ]
 
   deps = [
-    "//base/security/tpm:libtpm"
+    "//base/security/tcm:libtcm"
   ]
 }
 
@@ -109,13 +109,13 @@ static_library("openhitls_demo") {
   ]
 }
 
-static_library("vtpm_demo") {
+static_library("vtcm_demo") {
   sources = [ 
-    "vtpm_test/vtpm_scheduler_test.c", 
+    "vtcm_test/vtcm_scheduler_test.c", 
   ]
 
   include_dirs = [
-    "vtpm_test",
+    "vtcm_test",
   ]
 }
 
@@ -158,18 +158,18 @@ static_library("example") {
     include_dirs += [ "file_test" ]
   }
 
-  if (app_tpm_test) {
-    sources += [ "tpm_test/tpm_test.c" ]
-    deps += [ ":tpm_demo" ]
-    defines += [ "TPM_TEST" ]
+  if (app_tcm_test) {
+    sources += [ "tcm_test/tcm_test.c" ]
+    deps += [ ":tcm_demo" ]
+    defines += [ "TCM_TEST" ]
     include_dirs += [ 
-      "tpm_test" ,
-      "//base/security/security_tpm/Platform/include",
-      "//base/security/security_tpm/tpm/include",
-      "//base/security/tpm/tpm/include/public",
-      "//base/security/tpm/tpm/include/platform_interface",
-      "//base/security/tpm/TpmConfiguration/TpmConfiguration",
-      "//base/security/tpm/tpm/include/platform_interface/prototypes",
+      "tcm_test" ,
+      "//base/security/security_tcm/Platform/include",
+      "//base/security/security_tcm/tcm/include",
+      "//base/security/tcm/tcm/include/public",
+      "//base/security/tcm/tcm/include/platform_interface",
+      "//base/security/tcm/TpmConfiguration/TpmConfiguration",
+      "//base/security/tcm/tcm/include/platform_interface/prototypes",
     ]
   }
 
@@ -198,13 +198,13 @@ static_library("example") {
     ]
   }
 
-  if (app_vtpm_test) {
-    sources += [ "vtpm_test/vtpm_scheduler_test.c", ]
+  if (app_vtcm_test) {
+    sources += [ "vtcm_test/vtcm_scheduler_test.c", ]
     deps += [ 
-      ":vtpm_demo",
+      ":vtcm_demo",
       "//kernel/liteos_m/components/exchook:exchook", 
     ]
-    defines += [ "VTPM_TEST" ]
-    include_dirs += [ "vtpm_test", "//kernel/liteos_m/components/exchook", ]
+    defines += [ "VTCM_TEST" ]
+    include_dirs += [ "vtcm_test", "//kernel/liteos_m/components/exchook", ]
   }
 }   

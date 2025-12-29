@@ -14,7 +14,7 @@
  */
 
 #if defined(UI_TEST) || defined(ABILITY_TEST) || defined(HELLO_TEST) || defined(MATH_TEST) || defined(FILE_TEST) \
-                     || defined(TPM_TEST) || defined(MALLOC_TEST) || defined(OPENHITLS_SM2_TEST) || defined(VTPM_TEST)
+                     || defined(TCM_TEST) || defined(MALLOC_TEST) || defined(OPENHITLS_SM2_TEST) || defined(VTCM_TEST)
 #include "ohos_init.h"
 #include "ui_adapter.h"
 
@@ -34,8 +34,8 @@
 #if defined(FILE_TEST)
     #include "file_test.h"
 #endif
-#if defined(TPM_TEST)
-    #include "tpm_test.h"
+#if defined(TCM_TEST)
+    #include "tcm_test.h"
 #endif
 #if defined(MALLOC_TEST)
     #include "malloc_test.h"
@@ -43,8 +43,8 @@
 #if defined(OPENHITLS_SM2_TEST)
     #include "openhitls_sm2_test.h"
 #endif
-#if defined(VTPM_TEST)
-    #include "vtpm_scheduler_test.h"
+#if defined(VTCM_TEST)
+    #include "vtcm_scheduler_test.h"
 #endif
 
 void RunApp(void)
@@ -87,13 +87,13 @@ void AppFileTestEntry(void)
 }
 APP_FEATURE_INIT(AppFileTestEntry);
 
-void AppTPMTestEntry(void)
+void AppTCMTestEntry(void)
 {   
-#if defined(TPM_TEST)
-    TPMTestApp();
+#if defined(TCM_TEST)
+    TCMTestApp();
 #endif 
 }
-APP_FEATURE_INIT(AppTPMTestEntry);
+APP_FEATURE_INIT(AppTCMTestEntry);
 
 void AppMallocTestEntry(void)
 {
@@ -111,13 +111,13 @@ void AppOpenHiTLSSM2TestEntry(void)
 }
 APP_FEATURE_INIT(AppOpenHiTLSSM2TestEntry);
 
-void AppVtpmTestEntry(void)
+void AppVtcmTestEntry(void)
 {
-#if defined(VTPM_TEST)
-    // CreateVtpmTasks();
+#if defined(VTCM_TEST)
+    // CreateVtcmTasks();
     app_init();
 #endif
 }
-APP_FEATURE_INIT(AppVtpmTestEntry);
+APP_FEATURE_INIT(AppVtcmTestEntry);
 
 #endif

@@ -120,7 +120,7 @@
         "subsystem": "security",
         "components": [
           {
-            "component": "tpm",
+            "component": "tcm",
             "features": []
           }
         ]
